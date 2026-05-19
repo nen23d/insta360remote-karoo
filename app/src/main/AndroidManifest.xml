@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Permisos Bluetooth BLE -->
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!-- Servicio foreground (obligatorio para mantener conexión BLE en background) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
+
+    <application
+        android:name=".Insta360App"
+        android:label="Insta360 Control"
+        android:icon="@mipmap/ic_launcher"
+        android:theme="@style/Theme.KarooInsta360">
+
+        <!-- Actividad principal de configuración -->
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:label="Insta360 GO Ultra">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Servicio BLE foreground -->
+        <service
+            android:name=".ble.Insta360BleService"
+            android:foregroundServiceType="connectedDevice"
+            android:exported="false" />
+
+        <!-- Extensión Karoo: campo de datos de estado de cámara -->
+        <service
+            android:name=".extension.CameraStatusDataType"
+            android:exported="true"
+            android:permission="io.hammerhead.karooext.permission.EXTENSION">
+            <intent-filter>
+                <action android:name="io.hammerhead.karooext.EXTENSION" />
+            </intent-filter>
+            <meta-data
+                android:name="io.hammerhead.karooext.EXTENSION"
+                android:resource="@xml/extension" />
+        </service>
+
+        <!-- Extensión Karoo: campo de datos de batería de cámara -->
+        <service
+            android:name=".extension.CameraBatteryDataType"
+            android:exported="true"
+            android:permission="io.hammerhead.karooext.permission.EXTENSION">
+            <intent-filter>
+                <action android:name="io.hammerhead.karooext.EXTENSION" />
+            </intent-filter>
+            <meta-data
+                android:name="io.hammerhead.karooext.EXTENSION"
+                android:resource="@xml/extension" />
+        </service>
+
+    </application>
+</manifest>

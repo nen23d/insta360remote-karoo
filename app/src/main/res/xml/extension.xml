@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Descriptor de la extensión para Karoo OS.
+    Define los data types que aparecerán en el editor de perfiles.
+-->
+<karoo-extension
+    xmlns:karoo="http://schemas.hammerhead.io/karoo-ext"
+    karoo:id="io.karoo.insta360"
+    karoo:displayName="Insta360 GO Ultra"
+    karoo:description="Control y monitorización de cámara Insta360 GO Ultra vía BLE"
+    karoo:version="1">
+
+    <!-- Campo: Estado de grabación -->
+    <data-type
+        karoo:id="camera_status"
+        karoo:displayName="Cámara Estado"
+        karoo:description="Estado de grabación de la Insta360 GO Ultra"
+        karoo:graphical="true" />
+
+    <!-- Campo: Batería de cámara -->
+    <data-type
+        karoo:id="camera_battery"
+        karoo:displayName="Cámara Batería"
+        karoo:description="Nivel de batería de la Insta360 GO Ultra"
+        karoo:graphical="false"
+        karoo:unit="%" />
+
+</karoo-extension>
