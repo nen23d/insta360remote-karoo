@@ -50,7 +50,6 @@ class Insta360BleManager(private val context: Context) {
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
 
-        // Sin filtro — buscamos todos y filtramos por nombre en el callback
         scanner?.startScan(emptyList(), settings, scanCallback)
 
         mainHandler.postDelayed({
@@ -71,7 +70,6 @@ class Insta360BleManager(private val context: Context) {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device
             val name = if (hasPermissions()) device.name ?: return else return
-            // Detecta cualquier "GO Ultra XXXXXX" sin importar el sufijo
             if (!name.startsWith("GO Ultra")) return
             Timber.d("GO Ultra encontrada: $name [${device.address}]")
             stopScan()
@@ -89,6 +87,13 @@ class Insta360BleManager(private val context: Context) {
         _connectionState.value = ConnectionState.CONNECTING
         Timber.d("Conectando a ${device.name}...")
         gatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+    }
+
+    fun connectToAddress(address: String) {
+        if (!hasPermissions()) return
+        val device = bluetoothAdapter?.getRemoteDevice(address) ?: return
+        Timber.d("Conectando por dirección: $address")
+        connect(device)
     }
 
     fun disconnect() {
