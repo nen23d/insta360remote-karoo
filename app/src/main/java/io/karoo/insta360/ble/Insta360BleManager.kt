@@ -7,18 +7,22 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelUuid
 import androidx.core.app.ActivityCompat
-import io.karoo.insta360.ble.Insta360BleConstants.Commands
-import io.karoo.insta360.ble.Insta360BleConstants.DESCRIPTOR_CLIENT_CHAR_CONFIG
 import io.karoo.insta360.ble.Insta360BleConstants.CHAR_COMMAND_WRITE
 import io.karoo.insta360.ble.Insta360BleConstants.CHAR_STATUS_NOTIFY
+import io.karoo.insta360.ble.Insta360BleConstants.DESCRIPTOR_CLIENT_CHAR_CONFIG
 import io.karoo.insta360.ble.Insta360BleConstants.SERVICE_CAMERA_CONTROL
-import io.karoo.insta360.ble.Insta360BleConstants.SERVICE_CAMERA_STATUS
 import io.karoo.insta360.ble.Insta360BleConstants.ResponseParser
-import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import timber.log.Timber
 
+/**
+ * Insta360BleManager — modo GATT Server.
+ *
+ * El Karoo se anuncia como "Insta360 GPS Remote" para que la cámara
+ * lo reconozca como mando remoto y se conecte ella sola.
+ */
 class Insta360BleManager(private val context: Context) {
 
     private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
@@ -29,12 +33,13 @@ class Insta360BleManager(private val context: Context) {
 
     private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val bluetoothAdapter: BluetoothAdapter? get() = bluetoothManager.adapter
-    private var scanner: BluetoothLeScanner? = null
-    private var gatt: BluetoothGatt? = null
+    private var advertiser: BluetoothLeAdvertiser? = null
+    private var gattServer: BluetoothGattServer? = null
+    private var connectedDevice: BluetoothDevice? = null
     private var commandChar: BluetoothGattCharacteristic? = null
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val SCAN_TIMEOUT_MS = 15_000L
 
+    // ─── Iniciar advertising ────────────────────────────────────────────────
     fun startScan() {
         if (!hasPermissions()) {
             Timber.w("Faltan permisos BLE")
@@ -43,182 +48,218 @@ class Insta360BleManager(private val context: Context) {
         if (_connectionState.value != ConnectionState.DISCONNECTED) return
 
         _connectionState.value = ConnectionState.SCANNING
-        Timber.d("Iniciando escaneo BLE para GO Ultra...")
+        Timber.d("Iniciando GATT Server + advertising como 'Insta360 GPS Remote'...")
 
-        scanner = bluetoothAdapter?.bluetoothLeScanner
-        val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+        startGattServer()
+        startAdvertising()
+    }
+
+    private fun startAdvertising() {
+        if (!hasPermissions()) return
+        advertiser = bluetoothAdapter?.bluetoothLeAdvertiser
+
+        // El nombre del adaptador debe ser "Insta360 GPS Remote"
+        bluetoothAdapter?.name = "Insta360 GPS Remote"
+
+        val settings = AdvertiseSettings.Builder()
+            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+            .setConnectable(true)
+            .setTimeout(0) // sin timeout — sigue anunciando hasta conectar
+            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
             .build()
 
-        scanner?.startScan(emptyList(), settings, scanCallback)
+        val data = AdvertiseData.Builder()
+            .setIncludeDeviceName(true)
+            .setIncludeTxPowerLevel(false)
+            .addServiceUuid(ParcelUuid(SERVICE_CAMERA_CONTROL))
+            .build()
 
-        mainHandler.postDelayed({
-            if (_connectionState.value == ConnectionState.SCANNING) {
-                Timber.w("Timeout de escaneo — cámara no encontrada")
-                stopScan()
-                _connectionState.value = ConnectionState.DISCONNECTED
-            }
-        }, SCAN_TIMEOUT_MS)
+        advertiser?.startAdvertising(settings, data, advertiseCallback)
+        Timber.d("Advertising iniciado como 'Insta360 GPS Remote'")
     }
 
-    private fun stopScan() {
-        if (hasPermissions()) scanner?.stopScan(scanCallback)
-        scanner = null
-    }
-
-    private val scanCallback = object : ScanCallback() {
-        override fun onScanResult(callbackType: Int, result: ScanResult) {
-            val device = result.device
-            val name = if (hasPermissions()) device.name ?: return else return
-            if (!name.startsWith("GO Ultra")) return
-            Timber.d("GO Ultra encontrada: $name [${device.address}]")
-            stopScan()
-            connect(device)
+    private val advertiseCallback = object : AdvertiseCallback() {
+        override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
+            Timber.d("Advertising activo — esperando conexión de la cámara...")
         }
-
-        override fun onScanFailed(errorCode: Int) {
-            Timber.e("Escaneo fallido: código $errorCode")
+        override fun onStartFailure(errorCode: Int) {
+            Timber.e("Error advertising: $errorCode")
             _connectionState.value = ConnectionState.DISCONNECTED
         }
     }
 
-    private fun connect(device: BluetoothDevice) {
+    // ─── GATT Server ────────────────────────────────────────────────────────
+    private fun startGattServer() {
         if (!hasPermissions()) return
-        _connectionState.value = ConnectionState.CONNECTING
-        Timber.d("Conectando a ${device.name}...")
-        gatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+
+        gattServer = bluetoothManager.openGattServer(context, gattServerCallback)
+
+        // Servicio principal con característica de comando (Write) y notificación
+        val service = BluetoothGattService(
+            SERVICE_CAMERA_CONTROL,
+            BluetoothGattService.SERVICE_TYPE_PRIMARY
+        )
+
+        // Característica Write — recibe comandos de la cámara
+        val writeChar = BluetoothGattCharacteristic(
+            CHAR_COMMAND_WRITE,
+            BluetoothGattCharacteristic.PROPERTY_WRITE or
+                    BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
+            BluetoothGattCharacteristic.PERMISSION_WRITE
+        )
+
+        // Característica Notify — envía estado al dispositivo conectado
+        val notifyChar = BluetoothGattCharacteristic(
+            CHAR_STATUS_NOTIFY,
+            BluetoothGattCharacteristic.PROPERTY_NOTIFY,
+            BluetoothGattCharacteristic.PERMISSION_READ
+        )
+
+        // Descriptor obligatorio para notificaciones
+        val descriptor = BluetoothGattDescriptor(
+            DESCRIPTOR_CLIENT_CHAR_CONFIG,
+            BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE
+        )
+        notifyChar.addDescriptor(descriptor)
+
+        service.addCharacteristic(writeChar)
+        service.addCharacteristic(notifyChar)
+        gattServer?.addService(service)
+
+        commandChar = notifyChar
+        Timber.d("GATT Server iniciado")
     }
 
-    fun connectToAddress(address: String) {
-        if (!hasPermissions()) return
-        val device = bluetoothAdapter?.getRemoteDevice(address) ?: return
-        Timber.d("Conectando por dirección: $address")
-        connect(device)
-    }
-
-    fun disconnect() {
-        if (hasPermissions()) {
-            gatt?.disconnect()
-            gatt?.close()
-        }
-        gatt = null
-        commandChar = null
-        _connectionState.value = ConnectionState.DISCONNECTED
-        _cameraStatus.value = CameraStatus(false, -1, CameraMode.UNKNOWN)
-        Timber.d("Desconectado de GO Ultra")
-    }
-
-    private val gattCallback = object : BluetoothGattCallback() {
-        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+    private val gattServerCallback = object : BluetoothGattServerCallback() {
+        override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
+            if (!hasPermissions()) return
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    Timber.d("GATT conectado — descubriendo servicios...")
+                    Timber.d("Cámara conectada: ${device.name} [${device.address}]")
+                    connectedDevice = device
+                    stopAdvertising()
                     _connectionState.value = ConnectionState.CONNECTED
-                    if (hasPermissions()) gatt.discoverServices()
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
-                    Timber.d("GATT desconectado")
+                    Timber.d("Cámara desconectada")
+                    connectedDevice = null
                     _connectionState.value = ConnectionState.DISCONNECTED
-                    commandChar = null
+                    _cameraStatus.value = CameraStatus(false, -1, CameraMode.UNKNOWN)
+                    // Volver a anunciarse para reconexión
+                    startAdvertising()
                 }
             }
         }
 
-        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                Timber.e("Descubrimiento de servicios fallido: $status")
-                return
-            }
-            Timber.d("Servicios descubiertos")
-            setupCharacteristics(gatt)
-        }
-
-        override fun onCharacteristicChanged(
-            gatt: BluetoothGatt,
+        override fun onCharacteristicWriteRequest(
+            device: BluetoothDevice,
+            requestId: Int,
             characteristic: BluetoothGattCharacteristic,
+            preparedWrite: Boolean,
+            responseNeeded: Boolean,
+            offset: Int,
             value: ByteArray
         ) {
-            if (characteristic.uuid == CHAR_STATUS_NOTIFY) {
-                val status = ResponseParser.parseStatus(value)
-                _cameraStatus.value = status
-                Timber.d("Estado cámara: rec=${status.isRecording} bat=${status.batteryLevel}%")
+            if (!hasPermissions()) return
+            Timber.d("Comando recibido de cámara: ${value.toHex()}")
+            if (responseNeeded) {
+                gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
             }
+            // Parsear el comando recibido como estado
+            val status = ResponseParser.parseStatus(value)
+            _cameraStatus.value = status
         }
 
-        override fun onCharacteristicWrite(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            status: Int
+        override fun onDescriptorWriteRequest(
+            device: BluetoothDevice,
+            requestId: Int,
+            descriptor: BluetoothGattDescriptor,
+            preparedWrite: Boolean,
+            responseNeeded: Boolean,
+            offset: Int,
+            value: ByteArray
         ) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                Timber.d("Comando enviado correctamente")
-            } else {
-                Timber.e("Error enviando comando: $status")
+            if (!hasPermissions()) return
+            if (responseNeeded) {
+                gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
             }
+            Timber.d("Descriptor escrito por cámara")
         }
     }
 
-    private fun setupCharacteristics(gatt: BluetoothGatt) {
+    private fun stopAdvertising() {
+        if (hasPermissions()) advertiser?.stopAdvertising(advertiseCallback)
+        advertiser = null
+    }
+
+    // ─── Enviar comandos a la cámara ────────────────────────────────────────
+    // En modo servidor, enviamos notificaciones a la cámara conectada
+    private fun sendCommand(bytes: ByteArray) {
         if (!hasPermissions()) return
-        val controlService = gatt.getService(SERVICE_CAMERA_CONTROL)
-        val statusService = gatt.getService(SERVICE_CAMERA_STATUS)
-
-        commandChar = controlService?.getCharacteristic(CHAR_COMMAND_WRITE)
-
-        statusService?.getCharacteristic(CHAR_STATUS_NOTIFY)?.let { char ->
-            gatt.setCharacteristicNotification(char, true)
-            char.getDescriptor(DESCRIPTOR_CLIENT_CHAR_CONFIG)?.let { descriptor ->
-                descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                gatt.writeDescriptor(descriptor)
-            }
+        val device = connectedDevice ?: run {
+            Timber.w("Sin cámara conectada")
+            return
         }
-
-        mainHandler.postDelayed({ sendCommand(Commands.GET_STATUS) }, 500)
+        val char = commandChar ?: return
+        char.value = bytes
+        gattServer?.notifyCharacteristicChanged(device, char, false)
+        Timber.d("Comando enviado: ${bytes.toHex()}")
     }
 
     fun startRecording() {
         Timber.d("Iniciando grabación")
-        sendCommand(Commands.START_RECORDING)
+        sendCommand(Insta360BleConstants.Commands.START_RECORDING)
     }
 
     fun stopRecording() {
         Timber.d("Deteniendo grabación")
-        sendCommand(Commands.STOP_RECORDING)
+        sendCommand(Insta360BleConstants.Commands.STOP_RECORDING)
     }
 
     fun takePhoto() {
         Timber.d("Tomando foto")
-        sendCommand(Commands.TAKE_PHOTO)
+        sendCommand(Insta360BleConstants.Commands.TAKE_PHOTO)
     }
 
     fun markHighlight() {
         Timber.d("Marcando highlight")
-        sendCommand(Commands.MARK_HIGHLIGHT)
+        sendCommand(Insta360BleConstants.Commands.MARK_HIGHLIGHT)
     }
 
     fun setMode(mode: CameraMode) {
         val cmd = when (mode) {
-            CameraMode.VIDEO     -> Commands.MODE_VIDEO
-            CameraMode.PHOTO     -> Commands.MODE_PHOTO
-            CameraMode.TIMELAPSE -> Commands.MODE_TIMELAPSE
+            CameraMode.VIDEO     -> Insta360BleConstants.Commands.MODE_VIDEO
+            CameraMode.PHOTO     -> Insta360BleConstants.Commands.MODE_PHOTO
+            CameraMode.TIMELAPSE -> Insta360BleConstants.Commands.MODE_TIMELAPSE
             else -> return
         }
         sendCommand(cmd)
     }
 
     fun sendGpsData(lat: Double, lon: Double, speed: Float) {
-        sendCommand(Commands.gpsData(lat, lon, speed))
+        sendCommand(Insta360BleConstants.Commands.gpsData(lat, lon, speed))
     }
 
-    private fun sendCommand(bytes: ByteArray) {
-        if (!hasPermissions()) return
-        val char = commandChar ?: run {
-            Timber.w("Sin característica inicializada")
-            return
+    fun connectToAddress(address: String) {
+        // En modo servidor no necesitamos conectar por dirección
+        // la cámara se conecta sola al ver el advertising
+        Timber.d("Modo servidor — esperando conexión de $address")
+    }
+
+    fun disconnect() {
+        if (hasPermissions()) {
+            connectedDevice?.let { gattServer?.cancelConnection(it) }
         }
-        char.value = bytes
-        val success = gatt?.writeCharacteristic(char) ?: false
-        if (!success) Timber.e("writeCharacteristic devolvió false")
+        stopAdvertising()
+        gattServer?.close()
+        gattServer = null
+        connectedDevice = null
+        commandChar = null
+        _connectionState.value = ConnectionState.DISCONNECTED
+        _cameraStatus.value = CameraStatus(false, -1, CameraMode.UNKNOWN)
+        // Restaurar nombre original del adaptador
+        bluetoothAdapter?.name = "Karoo"
+        Timber.d("Servidor BLE cerrado")
     }
 
     val isConnected: Boolean
@@ -230,6 +271,8 @@ class Insta360BleManager(private val context: Context) {
                 ActivityCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_SCAN) ==
                 PackageManager.PERMISSION_GRANTED
     }
+
+    private fun ByteArray.toHex() = joinToString("") { "%02X".format(it) }
 }
 
 enum class ConnectionState {
