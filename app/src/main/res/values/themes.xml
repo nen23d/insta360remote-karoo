@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.KarooInsta360" parent="Theme.AppCompat.NoActionBar">
+        <item name="colorPrimary">#00FF88</item>
+        <item name="colorPrimaryDark">#0A0A0F</item>
+        <item name="colorAccent">#00FF88</item>
+        <item name="android:windowBackground">#0A0A0F</item>
+    </style>
+</resources>
