@@ -16,17 +16,19 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Instalar Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.4'
+
       - name: Credenciales karoo-ext
         run: |
           mkdir -p ~/.gradle
           echo "gpr.user=${{ github.actor }}" >> ~/.gradle/gradle.properties
           echo "gpr.key=${{ secrets.GITHUB_TOKEN }}" >> ~/.gradle/gradle.properties
 
-      - name: Permisos gradlew
-        run: chmod +x gradlew
-
       - name: Compilar APK
-        run: ./gradlew assembleDebug
+        run: gradle assembleDebug
 
       - name: Subir APK
         uses: actions/upload-artifact@v4
