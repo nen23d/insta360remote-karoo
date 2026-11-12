@@ -20,10 +20,6 @@ import io.karoo.insta360.ble.Insta360BleConstants.SERVICE_UUID
 import kotlinx.coroutines.flow.*
 import timber.log.Timber
 
-/**
- * El Karoo actúa como mando: servidor GATT CE80 + anuncio.
- * SCANNING = "modo sincronización" (anunciando, esperando a la cámara).
- */
 class Insta360BleManager(private val context: Context) {
 
     private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
@@ -35,6 +31,9 @@ class Insta360BleManager(private val context: Context) {
     private val _pairingSecondsLeft = MutableStateFlow(0)
     val pairingSecondsLeft: StateFlow<Int> = _pairingSecondsLeft.asStateFlow()
 
+    private val _log = MutableStateFlow<List<String>>(emptyList())
+    val log: StateFlow<List<String>> = _log.asStateFlow()
+
     private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val adapter: BluetoothAdapter? get() = bluetoothManager.adapter
     private var advertiser: BluetoothLeAdvertiser? = null
@@ -43,14 +42,20 @@ class Insta360BleManager(private val context: Context) {
     private var notifyChar: BluetoothGattCharacteristic? = null
     private var subscribed = false
     private var userDisconnect = false
+    private var advertiseRequested = false
     private var originalName: String? = null
     private val handler = Handler(Looper.getMainLooper())
+
+    private fun say(msg: String) {
+        Timber.d(msg)
+        _log.value = (_log.value + msg).takeLast(10)
+    }
 
     private val countdown = object : Runnable {
         override fun run() {
             val left = _pairingSecondsLeft.value - 1
             if (left <= 0) {
-                Timber.d("Fin del modo sincronización")
+                say("Fin del modo sincronización")
                 stopPairing()
             } else {
                 _pairingSecondsLeft.value = left
@@ -59,26 +64,42 @@ class Insta360BleManager(private val context: Context) {
         }
     }
 
-    // ─── Modo sincronización ────────────────────────────────────────────────
+    // Respaldo: si onServiceAdded no llega, anunciamos igualmente
+    private val advertiseFallback = Runnable {
+        if (_connectionState.value == ConnectionState.SCANNING && !advertiseRequested) {
+            say("onServiceAdded no llegó; anuncio igualmente")
+            startAdvertising()
+        }
+    }
+
     fun startScan() = startPairing()
 
     fun startPairing(durationSec: Int = 120) {
-        if (!hasPermissions()) { Timber.w("Faltan permisos BLE"); return }
+        if (!hasPermissions()) { say("ERROR: faltan permisos BLE"); return }
         if (_connectionState.value == ConnectionState.CONNECTED) return
+        val a = adapter
+        if (a == null) { say("ERROR: este equipo no tiene Bluetooth"); return }
+        say("BT activado=${a.isEnabled}, anuncio múltiple=${a.isMultipleAdvertisementSupported}")
+        if (!a.isEnabled) { say("ERROR: Bluetooth apagado"); return }
+
         userDisconnect = false
         closeServer()
         stopAdvertising()
-        if (originalName == null) originalName = adapter?.name
-        adapter?.name = REMOTE_NAME
+        if (originalName == null) originalName = a.name
+        a.name = REMOTE_NAME
+        say("Nombre BT puesto: ${a.name}")
         _connectionState.value = ConnectionState.SCANNING
         _pairingSecondsLeft.value = durationSec
         handler.removeCallbacks(countdown)
         handler.postDelayed(countdown, 1000)
-        startGattServer() // el anuncio arranca en onServiceAdded
+        startGattServer()
+        handler.removeCallbacks(advertiseFallback)
+        handler.postDelayed(advertiseFallback, 2000)
     }
 
     fun stopPairing() {
         handler.removeCallbacks(countdown)
+        handler.removeCallbacks(advertiseFallback)
         _pairingSecondsLeft.value = 0
         if (_connectionState.value == ConnectionState.SCANNING) {
             stopAdvertising()
@@ -88,17 +109,22 @@ class Insta360BleManager(private val context: Context) {
         }
     }
 
-    // ─── Anuncio ────────────────────────────────────────────────────────────
     private fun startAdvertising() {
-        if (!hasPermissions()) return
-        advertiser = adapter?.bluetoothLeAdvertiser
+        if (!hasPermissions() || advertiseRequested) return
+        val adv = adapter?.bluetoothLeAdvertiser
+        if (adv == null) {
+            say("ERROR: el Bluetooth no ofrece anunciante (advertiser = null)")
+            stopPairing()
+            return
+        }
+        advertiser = adv
+        advertiseRequested = true
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
             .setConnectable(true)
             .setTimeout(0)
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
             .build()
-        // Paquete principal: servicio HID 1812. Nombre en la respuesta al escaneo.
         val data = AdvertiseData.Builder()
             .setIncludeDeviceName(false)
             .addServiceUuid(ParcelUuid(HID_SERVICE_UUID))
@@ -106,15 +132,26 @@ class Insta360BleManager(private val context: Context) {
         val scanResponse = AdvertiseData.Builder()
             .setIncludeDeviceName(true)
             .build()
-        advertiser?.startAdvertising(settings, data, scanResponse, advertiseCallback)
+        say("Pidiendo anuncio...")
+        adv.startAdvertising(settings, data, scanResponse, advertiseCallback)
     }
 
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
-            Timber.d("Anunciando como $REMOTE_NAME")
+            say("ANUNCIO ACTIVO como $REMOTE_NAME")
         }
         override fun onStartFailure(errorCode: Int) {
-            Timber.e("Error de anuncio: $errorCode")
+            val motivo = when (errorCode) {
+                ADVERTISE_FAILED_DATA_TOO_LARGE -> "datos demasiado grandes"
+                ADVERTISE_FAILED_TOO_MANY_ADVERTISERS -> "demasiados anunciantes"
+                ADVERTISE_FAILED_ALREADY_STARTED -> "ya iniciado"
+                ADVERTISE_FAILED_INTERNAL_ERROR -> "error interno"
+                ADVERTISE_FAILED_FEATURE_UNSUPPORTED -> "no soportado por este Bluetooth"
+                else -> "desconocido"
+            }
+            say("ERROR de anuncio $errorCode: $motivo")
+            if (errorCode == ADVERTISE_FAILED_ALREADY_STARTED) return
+            advertiseRequested = false
             stopPairing()
         }
     }
@@ -122,12 +159,18 @@ class Insta360BleManager(private val context: Context) {
     private fun stopAdvertising() {
         if (hasPermissions()) advertiser?.stopAdvertising(advertiseCallback)
         advertiser = null
+        advertiseRequested = false
     }
 
-    // ─── Servidor GATT (copia del mando real) ───────────────────────────────
     private fun startGattServer() {
         if (!hasPermissions()) return
-        gattServer = bluetoothManager.openGattServer(context, gattServerCallback)
+        val server = bluetoothManager.openGattServer(context, gattServerCallback)
+        if (server == null) {
+            say("ERROR: no se pudo abrir el servidor GATT")
+            stopPairing()
+            return
+        }
+        gattServer = server
 
         val service = BluetoothGattService(SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
 
@@ -136,20 +179,18 @@ class Insta360BleManager(private val context: Context) {
             BluetoothGattCharacteristic.PROPERTY_WRITE,
             BluetoothGattCharacteristic.PERMISSION_WRITE
         )
-
         val ce82 = BluetoothGattCharacteristic(
             CHAR_NOTIFY,
             BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_READ,
             BluetoothGattCharacteristic.PERMISSION_READ
         )
-        ce82.value = ByteArray(8) // el mando real devuelve 8 ceros
+        ce82.value = ByteArray(8)
         ce82.addDescriptor(
             BluetoothGattDescriptor(
                 DESCRIPTOR_CCC,
                 BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE
             )
         )
-
         val ce83 = BluetoothGattCharacteristic(
             CHAR_INFO,
             BluetoothGattCharacteristic.PROPERTY_READ,
@@ -160,17 +201,18 @@ class Insta360BleManager(private val context: Context) {
         service.addCharacteristic(ce81)
         service.addCharacteristic(ce82)
         service.addCharacteristic(ce83)
-        gattServer?.addService(service)
+        val ok = server.addService(service)
+        say("Servidor GATT abierto, addService=$ok")
         notifyChar = ce82
     }
 
     private val gattServerCallback = object : BluetoothGattServerCallback() {
 
         override fun onServiceAdded(status: Int, service: BluetoothGattService) {
+            say("Servicio añadido, status=$status")
             if (status == BluetoothGatt.GATT_SUCCESS && _connectionState.value == ConnectionState.SCANNING) {
                 startAdvertising()
             } else if (status != BluetoothGatt.GATT_SUCCESS) {
-                Timber.e("No se pudo añadir el servicio: $status")
                 stopPairing()
             }
         }
@@ -179,7 +221,7 @@ class Insta360BleManager(private val context: Context) {
             if (!hasPermissions()) return
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    Timber.d("Cámara conectada: ${device.address}")
+                    say("CÁMARA CONECTADA: ${device.address}")
                     connectedDevice = device
                     handler.removeCallbacks(countdown)
                     _pairingSecondsLeft.value = 0
@@ -187,12 +229,11 @@ class Insta360BleManager(private val context: Context) {
                     _connectionState.value = ConnectionState.CONNECTED
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
-                    Timber.d("Cámara desconectada")
+                    say("Cámara desconectada")
                     connectedDevice = null
                     subscribed = false
                     _cameraStatus.value = CameraStatus(false, -1, CameraMode.UNKNOWN)
                     if (!userDisconnect) {
-                        // Pérdida inesperada: reabrir 60 s para que la cámara reconecte
                         _connectionState.value = ConnectionState.DISCONNECTED
                         handler.post { startPairing(60) }
                     }
@@ -205,9 +246,7 @@ class Insta360BleManager(private val context: Context) {
             characteristic: BluetoothGattCharacteristic
         ) {
             if (!hasPermissions()) return
-            gattServer?.sendResponse(
-                device, requestId, BluetoothGatt.GATT_SUCCESS, offset, characteristic.value
-            )
+            gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, characteristic.value)
         }
 
         override fun onCharacteristicWriteRequest(
@@ -217,7 +256,7 @@ class Insta360BleManager(private val context: Context) {
             offset: Int, value: ByteArray
         ) {
             if (!hasPermissions()) return
-            Timber.d("Escrito por la cámara en ${characteristic.uuid}: ${value.toHex()}")
+            say("Cámara escribió ${characteristic.uuid}: ${value.toHex()}")
             if (responseNeeded) {
                 gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
             }
@@ -241,50 +280,40 @@ class Insta360BleManager(private val context: Context) {
         ) {
             if (!hasPermissions()) return
             subscribed = value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-            Timber.d("La cámara ${if (subscribed) "se suscribió a" else "canceló"} CE82")
+            say("Cámara ${if (subscribed) "se suscribió a" else "canceló"} CE82")
             if (responseNeeded) {
                 gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
             }
         }
     }
 
-    // ─── Comandos ───────────────────────────────────────────────────────────
     private fun sendCommand(bytes: ByteArray) {
         if (!hasPermissions()) return
-        val device = connectedDevice ?: run { Timber.w("Sin cámara conectada"); return }
+        val device = connectedDevice ?: run { say("Sin cámara conectada"); return }
         val char = notifyChar ?: return
-        if (!subscribed) { Timber.w("La cámara aún no se ha suscrito a CE82"); return }
+        if (!subscribed) { say("La cámara aún no se ha suscrito a CE82"); return }
         char.value = bytes
         gattServer?.notifyCharacteristicChanged(device, char, false)
-        Timber.d("Enviado: ${bytes.toHex()}")
+        say("Enviado: ${bytes.toHex()}")
     }
 
-    // El obturador es un toggle; el estado de grabación es una suposición local
     fun toggleShutter() {
         _cameraStatus.value = _cameraStatus.value.copy(isRecording = !_cameraStatus.value.isRecording)
         sendCommand(Commands.SHUTTER)
     }
 
-    fun startRecording() {
-        if (!_cameraStatus.value.isRecording) toggleShutter()
-    }
-
-    fun stopRecording() {
-        if (_cameraStatus.value.isRecording) toggleShutter()
-    }
-
+    fun startRecording() { if (!_cameraStatus.value.isRecording) toggleShutter() }
+    fun stopRecording() { if (_cameraStatus.value.isRecording) toggleShutter() }
     fun takePhoto() = sendCommand(Commands.SHUTTER)
     fun toggleScreen() = sendCommand(Commands.SCREEN)
     fun powerOff() = sendCommand(Commands.POWER_OFF)
     fun setMode(mode: CameraMode) = sendCommand(Commands.MODE)
+    fun markHighlight() { say("Highlight no disponible por BLE") }
 
-    // No hay comando de highlight conocido (enviar SHUTTER pararía la grabación)
-    fun markHighlight() { Timber.w("Highlight no disponible por BLE") }
-
-    // ─── Cierre ─────────────────────────────────────────────────────────────
     fun disconnect() {
         userDisconnect = true
         handler.removeCallbacks(countdown)
+        handler.removeCallbacks(advertiseFallback)
         _pairingSecondsLeft.value = 0
         if (hasPermissions()) connectedDevice?.let { gattServer?.cancelConnection(it) }
         stopAdvertising()
