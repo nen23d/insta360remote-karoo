@@ -45,6 +45,7 @@ class MainActivity : ComponentActivity() {
             val connState by ble.connectionState.collectAsState()
             val camStatus by ble.cameraStatus.collectAsState()
             val secondsLeft by ble.pairingSecondsLeft.collectAsState()
+            val logLines by ble.log.collectAsState()
 
             val green = Color(0xFF00FF88)
             val red = Color(0xFFFF2828)
@@ -62,7 +63,6 @@ class MainActivity : ComponentActivity() {
                     Text("Mando BLE · Karoo 3", color = grey, fontSize = 11.sp, fontFamily = mono)
                     Divider(color = Color(0xFF1A1A1A))
 
-                    // Estado
                     Column(
                         Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
                             .background(Color(0xFF0D0D14)).padding(12.dp)
@@ -120,6 +120,25 @@ class MainActivity : ComponentActivity() {
                             ActionButton("DESCONECTAR", grey, Color(0xFF111111)) {
                                 ble.disconnect()
                             }
+                        }
+                    }
+
+                    // Registro de diagnóstico
+                    Column(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
+                            .background(Color(0xFF080810)).padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text("REGISTRO", color = grey, fontSize = 9.sp, fontFamily = mono)
+                        if (logLines.isEmpty()) {
+                            Text("Sin actividad", color = Color(0xFF333333), fontSize = 10.sp, fontFamily = mono)
+                        }
+                        logLines.forEach {
+                            Text(
+                                it,
+                                color = if (it.startsWith("ERROR")) red else Color(0xFF888888),
+                                fontSize = 10.sp, fontFamily = mono
+                            )
                         }
                     }
                 }
